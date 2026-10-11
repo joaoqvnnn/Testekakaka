@@ -1,8 +1,7 @@
 import os
-import json
-import sqlite3
 import logging
 import asyncio
+import sqlite3
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -18,13 +17,16 @@ from telegram.ext import (
 )
 from aiohttp import web
 
-# ---------- CONFIGURAÇÕES ----------
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MP_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CANAL_ID = int(os.getenv("CANAL_ID", "0"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://testekakaka.onrender.com")
 PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(
@@ -35,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
 
-# ---------- BANCO DE DADOS ----------
+# ============================================================
+# BANCO DE DADOS
+# ============================================================
 DB_NAME = "bot_database.db"
 
 
@@ -131,7 +135,9 @@ def obter_pedido(payment_id: str):
     return row
 
 
-# ---------- MERCADO PAGO ----------
+# ============================================================
+# MERCADO PAGO
+# ============================================================
 def criar_pagamento_pix(valor: float, descricao: str, user_id: int) -> dict:
     expire = datetime.now() + timedelta(minutes=30)
     expire_str = expire.strftime("%Y-%m-%dT%H:%M:%S.000-03:00")
@@ -158,7 +164,9 @@ def criar_pagamento_pix(valor: float, descricao: str, user_id: int) -> dict:
     return result
 
 
-# ---------- HANDLERS DO TELEGRAM ----------
+# ============================================================
+# HANDLERS DO TELEGRAM
+# ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     saldo = get_saldo(user.id)
@@ -176,9 +184,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if update.callback_query:
-        await update.callback_query.edit_message_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(
+            texto, reply_markup=reply_markup, parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text(texto, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.message.reply_text(
+            texto, reply_markup=reply_markup, parse_mode="Markdown"
+        )
 
 
 async def saldo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,7 +281,9 @@ async def voltar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
-# ---------- PAINEL ADMIN ----------
+# ============================================================
+# PAINEL ADMIN
+# ============================================================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -361,63 +375,67 @@ async def admin_processar_saldo(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Formato inválido. Use: `ID VALOR`", parse_mode="Markdown")
 
 
-# ---------- WEBHOOK ----------
+# ============================================================
+# WEBHOOK (unificado: Telegram + Mercado Pago)
+# ============================================================
 async def webhook_handler(request):
     try:
         data = await request.json()
         logger.info(f"Webhook recebido: {data}")
 
-        payment_id = None
-        if data.get("type") == "payment" or data.get("action", "").startswith("payment"):
-            payment_id = data.get("data", {}).get("id")
-
-        if not payment_id:
+        # -------- Caso 1: Update do Telegram --------
+        if "update_id" in data:
+            application: Application = request.app["telegram_app"]
+            update = Update.de_json(data, application.bot)
+            await application.process_update(update)
             return web.Response(status=200)
 
-        result = sdk.payment().get(payment_id)
-        if result.get("status") != 200:
-            logger.error(f"Erro ao consultar pagamento {payment_id}")
-            return web.Response(status=500)
+        # -------- Caso 2: Notificação do Mercado Pago --------
+        payment_id = None
+        if data.get("type") == "payment" or str(data.get("action", "")).startswith("payment"):
+            payment_id = data.get("data", {}).get("id")
 
-        payment = result["response"]
-        status = payment["status"]
+        if payment_id:
+            result = sdk.payment().get(payment_id)
+            if result.get("status") == 200:
+                payment = result["response"]
+                status = payment["status"]
+                atualizar_status_pedido(str(payment_id), status)
 
-        atualizar_status_pedido(str(payment_id), status)
+                if status == "approved":
+                    pedido = obter_pedido(str(payment_id))
+                    if pedido:
+                        pedido_user_id, produto, valor, _ = pedido
+                        if subtrair_saldo(pedido_user_id, valor):
+                            application: Application = request.app["telegram_app"]
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=pedido_user_id,
+                                    text=(
+                                        f"✅ *Compra aprovada!*\n\n"
+                                        f"Produto: {produto}\n"
+                                        f"Valor: R$ {valor:.2f}\n\n"
+                                        f"Seu saldo foi debitado."
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                            except Exception as e:
+                                logger.error(f"Erro ao enviar msg ao usuário: {e}")
 
-        if status == "approved":
-            pedido = obter_pedido(str(payment_id))
-            if pedido:
-                pedido_user_id, produto, valor, _ = pedido
-                if subtrair_saldo(pedido_user_id, valor):
-                    app = request.app["telegram_app"]
-                    try:
-                        await app.bot.send_message(
-                            chat_id=pedido_user_id,
-                            text=(
-                                f"✅ *Compra aprovada!*\n\n"
-                                f"Produto: {produto}\n"
-                                f"Valor: R$ {valor:.2f}\n\n"
-                                f"Seu saldo foi debitado."
-                            ),
-                            parse_mode="Markdown",
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar msg ao usuário: {e}")
-
-                    try:
-                        await app.bot.send_message(
-                            chat_id=CANAL_ID,
-                            text=(
-                                f"🛒 *Nova Compra Realizada!*\n\n"
-                                f"👤 Usuário: `{pedido_user_id}`\n"
-                                f"📦 Produto: {produto}\n"
-                                f"💰 Valor: R$ {valor:.2f}\n"
-                                f"🆔 Pagamento: `{payment_id}`"
-                            ),
-                            parse_mode="Markdown",
-                        )
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar msg ao canal: {e}")
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=CANAL_ID,
+                                    text=(
+                                        f"🛒 *Nova Compra Realizada!*\n\n"
+                                        f"👤 Usuário: `{pedido_user_id}`\n"
+                                        f"📦 Produto: {produto}\n"
+                                        f"💰 Valor: R$ {valor:.2f}\n"
+                                        f"🆔 Pagamento: `{payment_id}`"
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                            except Exception as e:
+                                logger.error(f"Erro ao enviar msg ao canal: {e}")
 
         return web.Response(status=200)
 
@@ -430,7 +448,9 @@ async def healthcheck(request):
     return web.Response(text="OK")
 
 
-# ---------- MAIN ----------
+# ============================================================
+# MAIN
+# ============================================================
 async def main_async():
     init_db()
 
@@ -450,14 +470,12 @@ async def main_async():
     await application.initialize()
     await application.start()
 
-    # Registra o webhook do Telegram
     await application.bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         allowed_updates=Update.ALL_TYPES,
     )
     logger.info(f"Webhook do Telegram configurado: {WEBHOOK_URL}/webhook")
 
-    # Servidor webhook para Mercado Pago
     app = web.Application()
     app["telegram_app"] = application
     app.router.add_post("/webhook", webhook_handler)
@@ -470,7 +488,6 @@ async def main_async():
     await site.start()
     logger.info(f"Servidor HTTP rodando na porta {PORT}")
 
-    # Mantém rodando
     await asyncio.Event().wait()
 
 
